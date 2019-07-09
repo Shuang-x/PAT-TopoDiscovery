@@ -1,0 +1,336 @@
+﻿#define SNum 3;
+#define PNum 4;
+#define HNum 3;
+enum{PktOut, PktIn, PtStatus};
+enum{ICMPEcho,LLDP,ARP};
+enum{S0,S1,S2};
+enum{P0,P1,P2,P3};
+enum{H0,H1,H2};
+enum{RESERVED,ANY,HOST,SWITCH};
+enum{PtUp,PtDown};
+enum{FALSE,TRUE};
+enum{Request, Reply};
+//==================================
+channel SC[SNum] 0;
+channel CS[SNum] 0;
+channel PtChange 0;
+channel CSend 0;
+channel Link 0;
+channel Host 0;
+//
+channel SP[SNum*(PNum-1)] 0;
+//
+channel SH[HNum] 0;
+//MsgHandler to PktPortSender
+channel SendPkt[SNum*PNum] 0;
+channel HandlePkt[SNum] 0;
+channel SendMsg[SNum] 0;
+channel HandleMsg[SNum] 0;
+channel Monitor[HNum] 0;
+//==================================
+var LinkExist[SNum][SNum]=[0,1,0,
+                           1,0,1,
+                           0,1,0];
+var LinkTable[SNum][SNum]=[-2,P1,-2, 
+                            P3,-2,P1,  
+                           -2,P3,-2];
+var PortTable[SNum][PNum][4]=[RESERVED,FALSE,-2,-2, ANY,FALSE,-2,-2, HOST,FALSE,H0,-2,  ANY,FALSE,-2,-2,
+                             RESERVED,FALSE,-2,-2, ANY,FALSE,-2,-2, ANY,FALSE,-2,-2, ANY,FALSE,-2,-2,
+                             RESERVED,FALSE,-2,-2, ANY,FALSE,-2,-2, HOST,FALSE,H1,-2, ANY,FALSE,-2,-2];
+var HostTable[HNum][2]=[S0,P2,
+                        S2,P2,
+                        S1,P2];
+//real locations of the hosts
+var HostLoc[HNum][2]=[S0,P2,
+                      S2,P2,
+                      S1,P2];
+
+//real topology among the switches
+var InterLink[SNum][SNum]=[-2,P1,-2, 
+                            P3,-2,P1,  
+                           -2,P3,-2];
+//==================================
+var is_new_link = FALSE;
+var port_type1 = ANY;
+var port_type2 = ANY;
+var host_loc[2] = [-1,-1];
+var port_type = ANY;
+var mflag = FALSE;
+
+var CIndex[SNum][PNum-1];//SP index
+var TIndex[HNum];//SH index
+//==================================
+Controller = (CReceiver|||CSender)||(LinkManager|||HostTracker);
+
+CReceiver = (([]x:{0..SNum-1} @ SC[x]?f0.f1.f2.f3.f4.f5->CReceiver1(f0,f1,f2,f3,f4,f5))
+            [](PtChange?f0.f1.f2.f3->HandlePtChange(f0,f1,f2,f3)));CReceiver;
+CReceiver1(f0,f1,f2,f3,f4,f5) = 
+         ifa(f0==PktIn)
+         {             
+             ifa(f3==LLDP) { Link!f0.f1.f2.f3.f4.f5->Skip }
+             else ifa(f3==ARP||f3==ICMPEcho){ Host!f0.f1.f2.f3.f4.f5->Skip}
+         }; 
+HandlePtChange(f0,f1,f2,f3) = ifa(f1==PtDown){setPt{PortTable[f2][f3][1]=ANY;PortTable[f2][f3][1]=TRUE;}->
+                                              Skip};
+
+CSender = CSend?x.f0.f1.f2.f3.f4->CS[x]!f0.f1.f2.f3.f4->CSender;
+
+LinkManager = LLDPConstructor1|||LLDPHandler;
+
+//LLDPConstructor = |||x:{0..SNum-1}@SendLLDP(x,1);
+//
+//SendLLDP(sw,pt) = ifa(pt>=1&&pt<=PNum[x]-1){CSend!x.PktOut.i.LLDP.x.i->SendLLDP(sw,pt)
+//                  else{Skip};
+
+LLDPConstructor =  |||x:{0..SNum-1}@(|||i:{1..PNum-1}@CSend!x.PktOut.i.LLDP.x.i->Skip);
+
+LLDPConstructor1 =  CSend!2.PktOut.2.LLDP.2.2->Skip;
+
+LLDPHandler = (Link?f0.f1.f2.f3.f4.f5->searchLink{
+                                          if(LinkExist[f4][f1]==1){is_new_link=FALSE;}
+                                          else{is_new_link=TRUE;}
+                                          }->
+              ifa(is_new_link==TRUE)
+              {
+                  getDT{port_type1=PortTable[f4][f5][0];port_type2=PortTable[f1][f2][0];}->
+                  ifa(port_type1==HOST||port_type2==HOST){attack->Skip}
+                  else{
+                      insertLink{LinkExist[f4][f1]=1;LinkTable[f4][f1]=f5;LinkTable[f1][f4]=f2;}->
+                      setDT{PortTable[f4][f5][0]=SWITCH;PortTable[f1][f2][0]=SWITCH;}->
+                      Skip}
+              }
+              else
+              {
+                  link_exists->Skip    
+              });LLDPHandler;
+              
+
+HostTracker = (Host?f0.f1.f2.f3.f4.f5->
+               ifa(f0==PktIn)
+               {
+                   ifa(f3==ARP){HandleARP(f0,f1,f2,f3,f4,f5)}
+                   else ifa(f3==ICMPEcho){HandleICMPEcho(f0,f1,f2,f3,f4,f5)}
+               }
+               else {Skip});HostTracker;
+HandleARP(f0,f1,f2,f3,f4,f5) = searchHost{host_loc[0]=HostTable[f4][0];host_loc[1]=HostTable[f4][1];}-> 
+                               getDT{port_type=PortTable[f1][f2][0];}->
+                               ifa(host_loc[0]==-2&&host_loc[1]==-2)
+                               {
+                                   ifa(port_type==SWITCH){attack->Skip}
+                                   else{HandleNewHost(f4,f1,f2)}
+                               }
+                               else
+                               {
+                                   ifa(host_loc[0]==f1&&host_loc[1]==f2){Skip}
+                                   else{HostMigration(f4,f1,f2,host_loc[0],host_loc[1])}
+                               };
+HandleNewHost(h,s,p) = insertHost{HostTable[h][0]=s;HostTable[h][1]=p;}->Skip;
+HostMigration(h,ns,np,os,op) =  getSDFlag{mflag=PortTable[os][op][1];}->
+                                ifa(mflag==TRUE)
+                                {
+                                    setLoc{HostTable[h][0]=ns;HostTable[h][1]=np;}->
+                                    setDT{PortTable[ns][np][0]=HOST;}->
+                                    addHostList{
+                                        if(PortTable[ns][np][2]==-2){PortTable[ns][np][2]=h;}
+                                        else if (PortTable[ns][np][3]==-2){PortTable[ns][np][3]=h;}
+                                        else {PortTable[ns][np][2]=-5;PortTable[ns][np][3]=-5;}}->
+                                    setSDFlag{PortTable[ns][np][1]=FALSE;}->
+                                    removeHostList{if(PortTable[os][op][2]==h){PortTable[os][op][2]=-2;}else if(PortTable[os][op][3]==h){PortTable[os][op][2]=-2;}}->
+                                    CSend!os.PktOut.op.ICMPEcho.Request.h->Skip
+                                }
+                                else{attack->Skip};
+HandleICMPEcho(f0,f1,f2,f3,f4,f5) = migrationattack->Skip;
+
+//========================================================
+//========================================================
+Switch(x)=(|||i:{1..PNum-1} @ (PktReceiver(x,i)|||PktSender(x,i)))
+          ||(MsgReceiver(x)|||MsgSender(x))
+          || PktHandler(x)||MsgHandler(x);
+MsgReceiver(x) = CS[x]?msgtype.param1.param2.param3.param4
+                 ->HandleMsg[x]!msgtype.param1.param2.param3.param4->MsgReceiver(x);
+              
+MsgSender(x) = SendMsg[x]?msgtype.param1.param2.param3.param4.param5
+                 ->SC[x]!msgtype.param1.param2.param3.param4.param5
+                 ->MsgSender(x);
+                 
+MsgHandler(x) =  HandleMsg[x]?msgtype.param1.param2.param3.param4->                    
+                    ifa(msgtype==PktOut)
+                    {
+                        SendPkt[x*PNum+param1]!param2.param3.param4->Skip
+                    };
+
+PktReceiver(x,i) = SP[x*(PNum-1)+i-1]?pkttype.f1.f2->HandlePkt[x]!i.pkttype.f1.f2->PktReceiver(x,i);
+
+PktSender(x,i) = (SendPkt[x*PNum+i]?pkttype.f1.f2->
+                     ifa(CIndex[x][i-1]>=100){
+                         SH[CIndex[x][i-1]-100]!pkttype.f1.f2->Skip
+                     }else{
+                         SP[CIndex[x][i-1]]!pkttype.f1.f2->Skip
+                     });PktSender(x,i);
+
+
+PktHandler(x) = HandlePkt[x]?port.pkttype.f1.f2->
+                SendMsg[x]!PktIn.x.port.pkttype.f1.f2->PktHandler(x);
+                       
+Init =  initCIndex{
+              var n=0; 
+              while(n<SNum){
+                  var m=0;
+                  while(m<PNum-1){
+                      CIndex[n][m]=-3;
+                      m++;
+                  }
+                  n++;
+              }}->
+              searchInterLink{
+                     var n = 0;
+                     while(n<SNum){
+                           var m = 0;
+                           var portn = -1;
+                           var portm = -1;
+                           var position = -1;
+                           while(m<SNum){
+                                 if(InterLink[n][m]>0){
+                                       portn = InterLink[n][m];
+                                       portm = InterLink[m][n];
+                                       position = m*(PNum-1)+(portm-1);//交换机n的端口portn和交换机m的端口portm相连,position记录了portm的channel SP[]的索引
+                                       CIndex[n][portn-1] = position;//port1的索引为0，port2的索引为1。
+                                 }
+                                 m++;
+                           }
+                           n++;
+                     }
+               }
+             ->searchHostLoc{
+                     var n = 0;
+                     while(n<HNum){
+                           var switch1 = HostLoc[n][0];
+                           var port = HostLoc[n][1];
+                           CIndex[switch1][port-1]=100+n;
+                           TIndex[n]=switch1*(PNum-1)+(port-1);
+                           n++;
+                     }
+             }
+             ->Skip;
+
+//========================================================
+//========================================================
+UnmovingHost(u,x,i) = UnmovingHost1(u,x,i);UnmovingHost(u,x,i);
+
+UnmovingHost1(u,x,i) = SH[u]?pkttype.f1.f2->
+                       ifa(pkttype==ICMPEcho&&f1==Request&&f2==u){SP[TIndex[u]]!ICMPEcho.Reply.u->Skip};
+
+MovingHost(u,x,i,y,j) = (UnmovingHost1(u,x,i);Migration(u,x,i,y,j))
+                      [](SH[u]?pkttype.f1.f2->Migration(u,x,i,y,j))
+                      [](Migration(u,x,i,y,j);UnmovingHost(u,y,j));
+
+Migration(u,x,i,y,j) = PtChange!PtStatus.PtDown.x.i->move{HostLoc[u][0]=y;HostLoc[u][1]=j;}->SP[y*(PNum-1)+j-1]!ARP.u.0->Skip;
+
+//========================================================
+//========================================================
+HostAttacker(x,i,u,v) = SP[x*(PNum-1)+i-1]!ARP.v.0->Skip;
+
+LinkAttacker(x,i,u,v) = Monitor[v]?pkttype.f1.f2->
+                        ifa(pkttype==LLDP){SP[x*(PNum-1)+i-1]!pkttype.f1.f2->LinkAttacker1(x,i,u,v)}
+                        else {LinkAttacker(x,i,u,v)};
+LinkAttacker1(x,i,u,v) = Monitor[v]?pkttype.f1.f2->LinkAttacker1(x,i,u,v);      
+//========================================================
+//========================================================
+
+UnmovingHostM(u,x,i) = UnmovingHostM1(u,x,i);UnmovingHostM(u,x,i); 
+UnmovingHostM1(u,x,i) = SH[u]?pkttype.f1.f2->Monitor[u]!pkttype.f1.f2->
+                       ifa(pkttype==ICMPEcho&&f1==Request&&f2==u){SP[TIndex[u]]!ICMPEcho.Reply.u->Skip};
+MovingHostM(u,x,i,y,j) = (first->UnmovingHostM1(u,x,i);Migration(u,x,i,y,j))
+                      [](SH[u]?pkttype.f1.f2->Monitor[u]!pkttype.f1.f2->Migration(u,x,i,y,j))
+                      [](Migration(u,x,i,y,j);UnmovingHostM(u,y,j));
+                       
+//========================================================
+//========================================================
+
+System = Init;(
+         (||x:{0..SNum-1}@Switch(x))||Controller
+         ||(Migration(H2,S1,P2,S2,P1);(MovingHostM(H1,S2,P2,S1,P2)|||UnmovingHost(H2,S2,P1)))
+         ||UnmovingHost(H0,S0,P2)
+         ||(HostAttacker(S0,P2,H0,H1)|||LinkAttacker(S0,P2,H0,H1)));
+         
+//========================================================
+//========================================================   
+  
+#define Fake_Link LinkTable[S2][S0]==P2&&LinkTable[S0][S2]==P2&&LinkExist[S2][S0]==1&&LinkExist[S0][S2]==0;
+#assert System reaches Fake_Link;
+
+#define Fake_Host HostTable[H1][0]==S0&&HostTable[H1][1]==P2;
+#assert System reaches Fake_Host;
+
+#define Migration_Finish HostLoc[H1][0]==S1&&HostLoc[H1][1]==P2&&
+                          HostTable[H1][0]==S1&&HostTable[H1][1]==P2&&
+                          HostLoc[H2][0]==S2&&HostLoc[H2][1]==P1&&
+                          HostTable[H2][0]==S2&&HostTable[H2][1]==P1;                          
+#assert System |= <> Migration_Finish;
+
+//========================================================
+//========================================================
+var LastSeenHost[SNum][PNum]=[-2,-2,H0,-2,
+                                -2,-2,H2,-2,
+                                -2,-2,H1,-2];
+var last_host = -2;
+
+NewHostTracker = (Host?f0.f1.f2.f3.f4.f5->
+               ifa(f0==PktIn)
+               {
+                   ifa(f3==ARP){NewHandleARP(f0,f1,f2,f3,f4,f5)}
+                   else ifa(f3==ICMPEcho){HandleICMPEcho(f0,f1,f2,f3,f4,f5)}
+               }
+               else {Skip});NewHostTracker;
+NewHandleARP(f0,f1,f2,f3,f4,f5) = searchHost{host_loc[0]=HostTable[f4][0];host_loc[1]=HostTable[f4][1];}-> 
+                               getDT{port_type=PortTable[f1][f2][0];}->
+                               ifa(host_loc[0]==-2&&host_loc[1]==-2)
+                               {
+                                   ifa(port_type==SWITCH){attack->Skip}
+                                   else{NewHandleNewHost(f4,f1,f2)}
+                               }
+                               else
+                               {
+                                   ifa(host_loc[0]==f1&&host_loc[1]==f2){Skip}
+                                   else{NewHostMigration(f4,f1,f2,host_loc[0],host_loc[1])}
+                               };
+NewHandleNewHost(h,s,p) = insertHost{HostTable[h][0]=s;HostTable[h][1]=p;LastSeenHost[s][p]=h;}->Skip;
+
+NewHostMigration(h,ns,np,os,op) =  getSDFlag{mflag=PortTable[ns][np][1];}->
+                                   getLastHost{last_host=LastSeenHost[ns][np];}->
+                                ifa(last_host==-2)
+                                {
+                                    SubMigration(h,ns,np,os,op) 
+                                }
+                                else{
+                                    ifa(mflag==TRUE){
+                                        SubMigration(h,ns,np,os,op)                                  
+                                    }
+                                    else{attack->Skip}
+                                };
+                                
+SubMigration(h,ns,np,os,op) = setLoc{HostTable[h][0]=ns;HostTable[h][1]=np;}->
+                              setDT{PortTable[ns][np][0]=HOST;}->
+                              setLastHost{LastSeenHost[ns][np]=h;}->
+                              setSDFlag{PortTable[ns][np][1]=FALSE;}->
+                              CSend!os.PktOut.op.ICMPEcho.Request.h->Skip;
+
+NewController = (CReceiver|||CSender)||(LinkManager|||NewHostTracker);
+//========================================================
+//========================================================   
+
+NewSystem = Init;(
+         (||x:{0..SNum-1}@Switch(x))||NewController
+         ||(Migration(H2,S1,P2,S2,P1);(MovingHostM(H1,S2,P2,S1,P2)|||UnmovingHost(H2,S2,P1)))
+         ||UnmovingHost(H0,S0,P2)
+         ||(HostAttacker(S0,P2,H0,H1)|||LinkAttacker(S0,P2,H0,H1)));
+         
+//========================================================
+//========================================================
+
+#assert NewSystem reaches Fake_Link;
+
+#assert NewSystem reaches Fake_Host;
+
+#assert NewSystem |= <> Migration_Finish;
+
